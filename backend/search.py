@@ -241,7 +241,17 @@ def search(pid, query, mode="auto", top_k=8):
             m["score"] = m["score"] * cov
     ranked = sorted(merged.values(), key=lambda r: r["score"], reverse=True)
     for r in ranked:
-        r["confidence"] = _confidence(r["score"])
+        conf = _confidence(r["score"])
+        # Hard cap: if the user named distinctive terms (names etc.) and
+        # none of them appear in the scene, it can never be high confidence
+        # no matter how strong the generic-word match is. Partial coverage
+        # caps at medium.
+        cov = r.get("cov_factor", 1.0)
+        if cov <= 0.36:  # floor value = zero distinctive terms matched
+            conf = "low"
+        elif cov < 1.0 and conf == "high":
+            conf = "medium"
+        r["confidence"] = conf
         r["score"] = round(r["score"], 3)
 
     results = ranked[:3]
