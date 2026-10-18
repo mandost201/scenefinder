@@ -130,6 +130,49 @@ def apply_seed_transcripts(pid):
     _write_marker(pid, h, seeded_yids | (prev_seeded & set(seeds)))
     return len(seeded)
 
+# ---------------------------------------------------------------- video uploads
+# Users can upload any video file -> transcribed on-device -> searchable,
+# jumping to the exact second with the built-in player.
+def _uploads_dir():
+    from backend.config import DATA_DIR
+    d = DATA_DIR / "uploads"
+    d.mkdir(parents=True, exist_ok=True)
+    return d
+
+def _upload_index_path():
+    return _uploads_dir() / "index.json"
+
+def _upload_video_path(youtube_id):
+    """Return the local file path for an uploaded video, or None."""
+    import json
+    try:
+        idx = json.loads(_upload_index_path().read_text())
+        p = Path(idx.get(youtube_id, ""))
+        if p.exists():
+            return p
+    except Exception:
+        pass
+    return None
+
+def _register_upload(youtube_id, path):
+    import json
+    ip = _upload_index_path()
+    try:
+        idx = json.loads(ip.read_text()) if ip.exists() else {}
+    except Exception:
+        idx = {}
+    idx[youtube_id] = str(path)
+    ip.write_text(json.dumps(idx))
+
+@st.cache_resource
+def _whisper_model():
+    from faster_whisper import WhisperModel
+    # "base" fits the free 1GB container; "small" is better if RAM allows.
+    return WhisperModel("base", device="cpu", compute_type="int8")
+
+def _is_upload_video(r):
+    return str(r.get("youtube_id") or "").startswith("upload-")
+
 st.set_page_config(
     page_title="SceneFinder — AI YouTube Scene Finder",
     page_icon="🎬",
@@ -250,7 +293,14 @@ if go and (query or "").strip():
             cols = st.columns([1, 1, 1])
             cols[0].metric("Timestamp", r["timestamp_hms"])
             cols[1].metric("Confidence", r["confidence"])
-            cols[2].link_button("▶ Watch scene", r["url_at"])
+            if _is_upload_video(r):
+                vpath = _upload_video_path(r["youtube_id"])
+                if vpath:
+                    cols[2].caption("▶ Plays below at the exact second")
+                else:
+                    cols[2].caption("Video file not found on server")
+            else:
+                cols[2].link_button("▶ Watch scene", r["url_at"])
             if r.get("reasons"):
                 st.write("**Why this matches:**")
                 for reason in r["reasons"]:
@@ -259,17 +309,72 @@ if go and (query or "").strip():
                 with st.expander("Matched dialogue"):
                     for line in r["matched_lines"]:
                         st.write(f"> {line}")
+            if _is_upload_video(r):
+                vpath = _upload_video_path(r["youtube_id"])
+                if vpath:
+                    st.video(str(vpath), start_time=int(r["timestamp"]))
 
     alts = res.get("alternatives") or []
     if alts:
         with st.expander(f"Other possible matches ({len(alts)})"):
             for r in alts:
-                st.markdown(
-                    f"- **Episode {r['episode']}** @ `{r['timestamp_hms']}` — "
-                    f"[{r['title']}]({r['url_at']}) ({r['confidence']})"
-                )
+                if _is_upload_video(r):
+                    st.markdown(
+                        f"- **{r['title']}** @ `{r['timestamp_hms']}` "
+                        f"({r['confidence']})"
+                    )
+                else:
+                    st.markdown(
+                        f"- **Episode {r['episode']}** @ `{r['timestamp_hms']}` — "
+                        f"[{r['title']}]({r['url_at']}) ({r['confidence']})"
+                    )
 elif go:
     st.warning("Please describe the scene first.")
 
 st.divider()
+
+# ---------------------------------------------------------------- upload & analyze your own video
+st.header("🎞 Or analyze your own video")
+st.caption("Upload any video — it gets fully transcribed, becomes searchable, "
+           "and plays back at the exact second of the scene.")
+up = st.file_uploader(
+    "Upload a video file",
+    type=["mp4", "mkv", "webm", "mov", "mp3", "wav", "m4a"],
+    key="vid_up",
+)
+if up is not None and st.button("🔍 Analyze uploaded video", type="primary", key="analyze_up"):
+    udir = _uploads_dir()
+    suffix = Path(up.name).suffix or ".mp4"
+    # create the playlist first so we can name the file after it
+    new_pid = db.create_playlist(f"upload:{up.name}", title=f"📁 {up.name}")
+    yid = f"upload-{new_pid}"
+    vpath = udir / f"{new_pid}{suffix}"
+    with open(vpath, "wb") as f:
+        f.write(up.getbuffer())
+    _register_upload(yid, vpath)
+    try:
+        with st.spinner("Transcribing video… long videos can take a while, please keep this page open."):
+            model = _whisper_model()
+            segments, _info = model.transcribe(str(vpath), beam_size=5)
+            segs = [(round(s.start, 1), round(s.end, 1), s.text.strip())
+                    for s in segments if s.text.strip()]
+    except Exception as e:
+        st.error(f"Transcription failed: {e}")
+        st.stop()
+    if not segs:
+        st.warning("No speech detected in this video.")
+        st.stop()
+    db.add_videos(new_pid, [{"youtube_id": yid, "title": up.name, "position": 1,
+                             "url": "", "thumbnail": None}])
+    v = db.get_videos(new_pid)[0]
+    db.add_segments(v["id"], segs)
+    db.mark_transcript(v["id"], True)
+    db.update_playlist(new_pid, status="ready", video_count=1)
+    with st.spinner("Indexing for search…"):
+        _embed_segments_for_videos(new_pid, {v["id"]})
+    search_mod.invalidate_cache(new_pid)
+    st.session_state.active_pid = new_pid
+    st.success(f"✅ Analyzed {len(segs)} segments from **{up.name}**. Describe a scene above to jump to it!")
+    st.rerun()
+
 st.caption("Note: analyzed data is kept while the app is running; very long playlists take a few minutes to analyze.")
