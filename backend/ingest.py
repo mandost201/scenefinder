@@ -28,6 +28,61 @@ def _seeded_youtube_ids():
         return set()
 
 
+def transcribe_missing_episodes(pid, progress_fn=None):
+    """Transcribe audio for videos that have no captions/transcript.
+    Returns the number of videos newly transcribed. progress_fn(stage,
+    current, total) is called for UI updates. Safe to call anytime;
+    skips videos already transcribed or covered by bundled seeds."""
+    from pathlib import Path as _P
+    from . import analyze as _analyze
+    from .youtube import download_audio as _dl_audio
+
+    def _prog(stage, cur, tot):
+        if progress_fn:
+            progress_fn(stage, cur, tot)
+
+    missing = [v for v in db.get_videos(pid) if not v["has_transcript"]]
+    seeded_ids = _seeded_youtube_ids()
+    missing = [v for v in missing if v["youtube_id"] not in seeded_ids]
+    if not missing:
+        return 0
+    tmpdir = _P(tempfile.mkdtemp(prefix="sf_whisper_"))
+    done = 0
+    try:
+        for i, v in enumerate(missing):
+            yid = v["youtube_id"]
+            _prog(f"Transcribing audio ({i+1}/{len(missing)})", i, len(missing))
+            mp3 = tmpdir / f"{yid}.mp3"
+            try:
+                _dl_audio(yid, mp3)
+                segs = _analyze.transcribe_audio_file(mp3)
+                if segs:
+                    db.add_segments(v["id"], segs)
+                    db.mark_transcript(v["id"], True)
+                    done += 1
+                    print(f"[ingest] whisper ok: {yid} ({len(segs)} segs)")
+                else:
+                    print(f"[ingest] whisper empty: {yid}")
+            except Exception as e:
+                print(f"[ingest] whisper failed for {yid}: {e}")
+            finally:
+                try:
+                    mp3.unlink()
+                except OSError:
+                    pass
+    finally:
+        try:
+            tmpdir.rmdir()
+        except OSError:
+            pass
+    if done:
+        # re-index so the new transcripts are semantically searchable
+        _index_embeddings(pid)
+        search_mod.invalidate_cache(pid)
+    _prog("done", len(missing), len(missing))
+    return done
+
+
 def run_playlist_job(jid: str, pid: str, url: str):
     def progress(stage, current, total):
         db.update_job(jid, status="running", stage=stage,
@@ -67,43 +122,10 @@ def run_playlist_job(jid: str, pid: str, url: str):
             list(ex.map(one, stored))
 
         # ---- whisper transcription for videos with no captions at all.
-        # This is what makes "100% analysis" possible for any playlist:
-        # episodes YouTube provides no captions for get transcribed from
-        # audio instead of being left invisible to search. Skips videos
-        # covered by bundled verified seeds (they're better quality).
-        missing = [v for v in db.get_videos(pid) if not v["has_transcript"]]
-        seeded_ids = _seeded_youtube_ids()
-        missing = [v for v in missing if v["youtube_id"] not in seeded_ids]
-        if missing:
-            from pathlib import Path as _P
-            from . import analyze as _analyze
-            from .youtube import download_audio as _dl_audio
-            tmpdir = _P(tempfile.mkdtemp(prefix="sf_whisper_"))
-            for i, v in enumerate(missing):
-                yid = v["youtube_id"]
-                progress(f"Transcribing audio ({i+1}/{len(missing)})",
-                         i, len(missing))
-                mp3 = tmpdir / f"{yid}.mp3"
-                try:
-                    _dl_audio(yid, mp3)
-                    segs = _analyze.transcribe_audio_file(mp3)
-                    if segs:
-                        db.add_segments(v["id"], segs)
-                        db.mark_transcript(v["id"], True)
-                        print(f"[ingest] whisper ok: {yid} ({len(segs)} segs)")
-                    else:
-                        print(f"[ingest] whisper empty: {yid}")
-                except Exception as e:
-                    print(f"[ingest] whisper failed for {yid}: {e}")
-                finally:
-                    try:
-                        mp3.unlink()
-                    except OSError:
-                        pass
-            try:
-                tmpdir.rmdir()
-            except OSError:
-                pass
+        # This is what makes "100% analysis" possible for any playlist.
+        n_whisper = transcribe_missing_episodes(pid, progress_fn=progress)
+        if n_whisper:
+            print(f"[ingest] whisper transcribed {n_whisper} videos")
 
         # ---- embeddings
         progress("Indexing for semantic search", 0, 1)
