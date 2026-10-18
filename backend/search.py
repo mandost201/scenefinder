@@ -4,15 +4,66 @@ Two honest signals, blended:
   * keyword  - SQLite FTS5 BM25 over transcript segments (exact dialogue)
   * semantic - cosine similarity of query vs segment embeddings (meaning)
 
+A third guard, distinctive-term coverage, keeps generic words ("dies",
+"death", "scene") from producing high-confidence false positives: a result
+only keeps a high score when the query's distinctive terms (names, places,
+specific actions) actually appear in the matched scene's text.
 Results map to episode (playlist position), timestamp, and a deep link.
 Confidence is derived from the actual scores and labelled plainly.
 """
+import re
+
 import numpy as np
 
 from . import db
 from . import embeddings
 from .vtt import format_hms
 from .youtube import watch_url_at
+
+# Words too generic to identify a scene on their own. Everything else in the
+# query is "distinctive" and must show up in the matched scene for a high
+# confidence score. Covers English + Roman Urdu.
+_GENERIC_TERMS = frozenset("""
+dies die death dead killing kill killed kills murdered murder suicide
+scene scenes seen episode episodes moment moments part parts clip video
+where when what which who whom whose how
+the a an in on of to and or is are was were be been has have had
+ki ka ke ko se ne mein me main hai hain tha thi they thay
+wala wale wali yeh ye woh wo ek aik aur lekin par per bhi
+""".split())
+
+
+def _skeleton(s):
+    """Consonant skeleton: catches transliteration variants
+    (suleman ~ suleiman ~ suleyman -> slmn)."""
+    return "".join(c for c in s.lower() if c.isalpha() and c not in "aeiou")
+
+
+def distinctive_terms(query):
+    terms = [t for t in re.findall(r"[a-zA-Z]+", (query or "").lower())
+             if t not in _GENERIC_TERMS and len(t) > 1]
+    return list(dict.fromkeys(terms))
+
+
+def _term_in_text(term, text):
+    tl = text.lower()
+    if term in tl:
+        return True
+    if len(term) >= 4:
+        sk = _skeleton(term)
+        if len(sk) >= 3 and sk in _skeleton(tl):
+            return True
+    return False
+
+
+def coverage_factor(distinctive, text):
+    """Return (factor, hits). factor in [0.35, 1.0]: 1.0 when every
+    distinctive term appears in the text, down to 0.35 when none do."""
+    if not distinctive:
+        return 1.0, 0
+    hits = sum(1 for t in distinctive if _term_in_text(t, text or ""))
+    cov = hits / len(distinctive)
+    return 0.35 + 0.65 * cov, hits
 
 # in-memory cache of playlist embeddings: pid -> dict
 _emb_cache = {}
@@ -84,6 +135,7 @@ def keyword_search(pid, query, top_k=8):
     if not hits:
         return [], "keyword"
     videos = _videos_by_id(pid)
+    dist = distinctive_terms(query)
     # best segment per video (fts rank is negative BM25: more negative = better)
     best = {}
     for h in hits:
@@ -104,9 +156,15 @@ def keyword_search(pid, query, top_k=8):
         if phrase and phrase in h["text"].lower():
             score = min(1.0, score + 0.15)
         lines = _nearby_lines(vid, h["start"])
-        results.append(_build_result(
-            video, h["start"], score, "keyword", lines,
-            [f"Dialogue match: \"{h['text'][:120]}\""]))
+        cov, cov_hits = coverage_factor(dist, h["text"])
+        reasons = [f"Dialogue match: \"{h['text'][:120]}\""]
+        if dist and cov < 1.0:
+            reasons.append(
+                f"Only {cov_hits}/{len(dist)} distinctive "
+                f"term(s) ({', '.join(dist)}) appear in this scene's dialogue")
+        r = _build_result(video, h["start"], score, "keyword", lines, reasons)
+        r["cov_factor"] = round(cov, 3)
+        results.append(r)
     return results, "keyword"
 
 
@@ -116,6 +174,7 @@ def semantic_search(pid, query, top_k=8):
     cache = _playlist_embeddings(pid)
     if cache["matrix"] is None:
         return [], "semantic-empty"
+    dist = distinctive_terms(query)
     q = embeddings.embed([query])[0]
     sims = cache["matrix"] @ q  # cosine (normalized)
     order = np.argsort(-sims)
@@ -133,9 +192,17 @@ def semantic_search(pid, query, top_k=8):
             continue
         start = float(cache["starts"][idx])
         lines = _nearby_lines(vid, start)
-        results.append(_build_result(
-            video, start, float(sims[idx]), "semantic", lines,
-            ["Meaning/semantic match to your description"]))
+        context = " ".join(l["text"] for l in lines)
+        cov, cov_hits = coverage_factor(dist, context)
+        reasons = ["Meaning/semantic match to your description"]
+        if dist and cov < 1.0:
+            reasons.append(
+                f"Only {cov_hits}/{len(dist)} distinctive "
+                f"term(s) ({', '.join(dist)}) appear near this scene")
+        r = _build_result(video, start, float(sims[idx]), "semantic",
+                          lines, reasons)
+        r["cov_factor"] = round(cov, 3)
+        results.append(r)
         if len(results) >= top_k:
             break
     return results, "semantic"
@@ -159,10 +226,19 @@ def search(pid, query, mode="auto", top_k=8):
             m = merged[r["video_id"]]
             m["score"] = min(1.0, m["score"] + r["score"] * 0.45)
             m["method"] = "keyword+semantic"
+            # keep the stronger distinctive-term coverage of the two signals
+            m["cov_factor"] = max(m.get("cov_factor", 1.0),
+                                  r.get("cov_factor", 1.0))
             if r["score"] > 0.5:
                 m["reasons"].append("Also a strong semantic match to the description")
         else:
             merged[r["video_id"]] = dict(r, score=r["score"] * 0.9)
+    # Distinctive-term coverage guard: generic words ("dies", "death", "scene")
+    # must not produce high-confidence false positives on their own.
+    for m in merged.values():
+        cov = m.get("cov_factor", 1.0)
+        if cov < 1.0:
+            m["score"] = m["score"] * cov
     ranked = sorted(merged.values(), key=lambda r: r["score"], reverse=True)
     for r in ranked:
         r["confidence"] = _confidence(r["score"])
@@ -188,6 +264,12 @@ def search(pid, query, mode="auto", top_k=8):
         note = ("No matching scenes found in this playlist's transcripts. "
                 "Try fewer/different words, or check that the videos have "
                 "captions (videos without captions can't be searched).")
+    elif ranked[0].get("cov_factor", 1.0) <= 0.36:
+        dist = distinctive_terms(query)
+        note = ("No scene mentions the distinctive terms in your description"
+                + (f" ({', '.join(dist)})" if dist else "")
+                + ". The matches below are weak — try different words or "
+                  "check the spelling of names.")
     return {"results": results, "alternatives": alternatives,
             "method": method_note, "note": note,
             "semantic_available": embeddings.available()}
