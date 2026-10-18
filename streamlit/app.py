@@ -461,8 +461,24 @@ if st.button("🔍 Find episode for this clip", type="primary", key="find_ep",
         f.write(up2.getbuffer())
     try:
         with st.spinner("Transcribing clip and matching against the playlist…"):
-            from backend import analyze as _analyze
-            result = _analyze.analyze_clip(pid, cpath)
+            # transcribe without ffmpeg (not available on Streamlit Cloud)
+            segs = _transcribe_upload(cpath)
+            clip_text = " ".join(t for _, _, t in segs)
+            if not clip_text.strip():
+                st.warning("No speech detected in the clip. Clips are matched by spoken dialogue.")
+                st.stop()
+            # align against the selected playlist (no ffmpeg needed)
+            from backend.align import align_against_playlist
+            from backend import search as _search
+            from backend.vtt import format_hms
+            from backend.youtube import watch_url_at
+            videos = db.get_videos(pid)
+            pairs = []
+            for v in videos:
+                s = db.get_segments(v["id"])
+                if s:
+                    pairs.append((v, s))
+            ranked = align_against_playlist(clip_text, pairs)
     except Exception as e:
         st.error(f"Could not analyze the clip: {e}")
         st.stop()
@@ -471,20 +487,27 @@ if st.button("🔍 Find episode for this clip", type="primary", key="find_ep",
             cpath.unlink()
         except OSError:
             pass
-    if not result.get("ok"):
-        st.error(result.get("error", "Could not analyze the clip."))
-        st.stop()
-    results = result.get("results", []) + result.get("alternatives", [])
-    if not results:
+    if not ranked:
         st.warning("No matching episode found. The clip's dialogue doesn't match any episode's transcript closely. "
                    "Try describing the scene in words instead.")
         with st.expander("Clip transcript"):
-            st.write(result.get("clip_transcript", ""))
+            st.write(clip_text)
         st.stop()
+
+    def _to_result(score, video, a):
+        conf = _search._confidence(score)
+        return {
+            "episode": video["position"], "title": video["title"],
+            "timestamp_hms": format_hms(a["offset"]),
+            "url_at": watch_url_at(video["youtube_id"], a["offset"]),
+            "confidence": conf, "score": round(score, 3),
+        }
+
+    results = [_to_result(s, v, a) for s, v, a in ranked[:3]]
     st.success(f"✅ Found it!")
     with st.expander("Clip transcript"):
-        st.write(result.get("clip_transcript", ""))
-    for r in results[:3]:
+        st.write(clip_text)
+    for r in results:
         ep = r.get("episode", "?")
         title = r.get("title", "")
         ts = r.get("timestamp_hms", "")
