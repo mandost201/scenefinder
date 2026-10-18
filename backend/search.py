@@ -46,14 +46,9 @@ def distinctive_terms(query):
 
 
 def _term_in_text(term, text):
-    tl = text.lower()
-    if term in tl:
-        return True
-    if len(term) >= 4:
-        sk = _skeleton(term)
-        if len(sk) >= 3 and sk in _skeleton(tl):
-            return True
-    return False
+    # Exact substring only (case-insensitive). Skeleton/transliteration
+    # matching caused false positives, so it's disabled for coverage.
+    return term in text.lower()
 
 
 def coverage_factor(distinctive, text):
