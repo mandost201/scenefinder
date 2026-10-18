@@ -31,6 +31,34 @@ def _load_seeds():
         print(f"[seeds] load failed: {e}")
     return {}
 
+def _seeds_hash():
+    import hashlib
+    try:
+        return hashlib.md5(SEEDS_PATH.read_bytes()).hexdigest()[:12]
+    except Exception:
+        return "none"
+
+def _marker_path(pid):
+    from backend.config import DATA_DIR
+    return DATA_DIR / f".seeds_applied_{pid}.json"
+
+def _read_marker(pid):
+    import json
+    try:
+        p = _marker_path(pid)
+        if p.exists():
+            return json.loads(p.read_text())
+    except Exception:
+        pass
+    return {}
+
+def _write_marker(pid, h, seeded_yids):
+    import json
+    try:
+        _marker_path(pid).write_text(json.dumps({"hash": h, "videos": sorted(seeded_yids)}))
+    except Exception as e:
+        print(f"[seeds] marker write failed: {e}")
+
 def _embed_segments_for_videos(pid, video_ids):
     """Embed only the segments of the given videos (used after seeding)."""
     if not emb_mod.available():
@@ -59,25 +87,47 @@ def _embed_segments_for_videos(pid, video_ids):
 
 def apply_seed_transcripts(pid):
     """Fill in transcripts for videos that have none, from bundled seeds.
-    Returns number of videos seeded."""
+    Version-aware: when seeds.json changes, previously-seeded videos get
+    re-seeded (never clobbers real YouTube captions). Returns count applied."""
     seeds = _load_seeds()
     if not seeds:
         return 0
-    seeded = []
+    h = _seeds_hash()
+    marker = _read_marker(pid)
+    if marker.get("hash") == h:
+        return 0  # already up to date
+    prev_seeded = set(marker.get("videos") or [])
+    # Migration: the first seed rollout wrote no marker. Detect videos that
+    # were seeded by it (their segments contain seed text) so updates apply.
+    seed_texts = {str(s[2]) for segs in seeds.values() for s in segs}
+    if not marker:
+        for v in db.get_videos(pid):
+            yid = v.get("youtube_id")
+            if yid in seeds and v.get("has_transcript"):
+                try:
+                    cur = {s["text"] for s in db.get_segments(v["id"])}
+                except Exception:
+                    cur = set()
+                if cur & seed_texts:
+                    prev_seeded.add(yid)
+    seeded, seeded_yids = [], set()
     for v in db.get_videos(pid):
-        if v.get("has_transcript"):
-            continue
         yid = v.get("youtube_id")
-        if yid in seeds:
-            segs = [(float(s[0]), float(s[1]), str(s[2])) for s in seeds[yid]]
-            db.add_segments(v["id"], segs)
-            db.mark_transcript(v["id"], True)
-            seeded.append(v["id"])
-            print(f"[seeds] seeded transcript for {yid} ({len(segs)} segments)")
+        if yid not in seeds:
+            continue
+        # seed only videos without real captions, or ones we seeded before
+        if v.get("has_transcript") and yid not in prev_seeded:
+            continue
+        segs = [(float(s[0]), float(s[1]), str(s[2])) for s in seeds[yid]]
+        db.add_segments(v["id"], segs)  # replaces existing segments
+        db.mark_transcript(v["id"], True)
+        seeded.append(v["id"])
+        seeded_yids.add(yid)
+        print(f"[seeds] seeded transcript for {yid} ({len(segs)} segments)")
     if seeded:
         _embed_segments_for_videos(pid, set(seeded))
         search_mod.invalidate_cache(pid)
-        db.update_playlist(pid, status="ready")
+    _write_marker(pid, h, seeded_yids | (prev_seeded & set(seeds)))
     return len(seeded)
 
 st.set_page_config(
