@@ -342,7 +342,11 @@ up = st.file_uploader(
     type=["mp4", "mkv", "webm", "mov", "mp3", "wav", "m4a"],
     key="vid_up",
 )
-if up is not None and st.button("🔍 Analyze uploaded video", type="primary", key="analyze_up"):
+if st.button("🔍 Analyze uploaded video", type="primary", key="analyze_up",
+             disabled=up is None):
+    if up is None:
+        st.warning("Please choose a video file first.")
+        st.stop()
     udir = _uploads_dir()
     suffix = Path(up.name).suffix or ".mp4"
     # create the playlist first so we can name the file after it
