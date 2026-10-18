@@ -16,8 +16,6 @@ import threading
 import urllib.request
 from pathlib import Path
 
-from PIL import Image
-
 from . import db
 from . import search as search_mod
 from .align import align_against_playlist
@@ -71,6 +69,29 @@ def transcribe_clip(path: Path):
     segments, _ = model.transcribe(audio, beam_size=5)
     out = [(s.start, s.end, s.text.strip()) for s in segments if s.text.strip()]
     return " ".join(t for _, _, t in out), out
+
+
+def transcribe_audio_file(path: Path):
+    """Transcribe an audio/video file directly. Returns list of
+    (start, end, text). Works around the faster-whisper/PyAV
+    metadata_errors incompatibility on old installs."""
+    model = _whisper()
+    try:
+        segments, _ = model.transcribe(str(path), beam_size=5)
+    except TypeError:
+        import av
+        _orig = av.open
+
+        def _patched(*a, **k):
+            k.pop("metadata_errors", None)
+            return _orig(*a, **k)
+        av.open = _patched
+        try:
+            segments, _ = model.transcribe(str(path), beam_size=5)
+        finally:
+            av.open = _orig
+    return [(round(s.start, 1), round(s.end, 1), s.text.strip())
+            for s in segments if s.text.strip()]
 
 
 def analyze_clip(pid, upload_path: Path):
@@ -128,7 +149,8 @@ def analyze_clip(pid, upload_path: Path):
 
 
 # ---------------------------------------------------------- screenshots
-def _dhash(img: Image.Image, size=9):
+def _dhash(img, size=9):
+    from PIL import Image
     img = img.convert("L").resize((size, size - 1), Image.LANCZOS)
     px = list(img.getdata())
     bits = 0
@@ -145,6 +167,7 @@ def _hamming(a, b):
 def _ocr_text(path: Path):
     try:
         import pytesseract
+        from PIL import Image
         img = Image.open(path)
         # upscale small images for better OCR
         if max(img.size) < 1200:
@@ -190,6 +213,7 @@ def analyze_screenshots(pid, image_paths):
     shot_hashes = []
     for p in image_paths:
         try:
+            from PIL import Image
             shot_hashes.append(_dhash(Image.open(p)))
         except Exception:
             continue
@@ -199,6 +223,7 @@ def analyze_screenshots(pid, image_paths):
         if not tp or not shot_hashes:
             continue
         try:
+            from PIL import Image
             th = _dhash(Image.open(tp))
         except Exception:
             continue

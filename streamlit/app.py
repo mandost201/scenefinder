@@ -11,6 +11,13 @@ from pathlib import Path
 # repo root (parent of streamlit/) holds the reusable backend package
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
+import os
+# tiny Whisper fits the free 1GB container for bulk playlist backfill;
+# uploads use "base" for better quality (see _whisper_model below).
+os.environ.setdefault("WHISPER_MODEL", "tiny")
+os.environ.setdefault("SEEDS_PATH",
+                      str(Path(__file__).resolve().parent / "seeds.json"))
+
 import streamlit as st
 
 from backend import db, ingest

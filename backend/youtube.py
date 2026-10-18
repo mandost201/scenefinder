@@ -208,3 +208,30 @@ def _transcript_api(video_id: str):
     segs = [(s.start, s.start + s.duration, s.text.replace("\n", " ").strip())
             for s in tr if s.text.strip()]
     return segs or None
+
+
+def download_audio(video_id: str, out_path):
+    """Download best audio track as mp3. Returns the mp3 Path.
+    Raises RuntimeError on failure."""
+    from pathlib import Path
+    out_path = Path(out_path)
+    stem = out_path.with_suffix("")  # yt-dlp adds .%(ext)s itself
+    cmd = YTDLP + ["-f", "ba/b", "-x", "--audio-format", "mp3",
+                   "--no-playlist", "--no-warnings",
+                   "--extractor-args", "youtube:player_client=android",
+                   "-o", str(stem) + ".%(ext)s",
+                   f"https://www.youtube.com/watch?v={video_id}"]
+    proc = subprocess.run(cmd, capture_output=True, text=True, timeout=900)
+    final = stem.with_suffix(".mp3")
+    # clean up any non-mp3 leftovers from -x
+    for p in stem.parent.glob(stem.name + ".*"):
+        if p != final:
+            try:
+                p.unlink()
+            except OSError:
+                pass
+    if not final.exists() or final.stat().st_size < 50000:
+        raise RuntimeError(
+            f"audio download failed for {video_id}: "
+            f"{(proc.stderr or proc.stdout)[-300:]}")
+    return final

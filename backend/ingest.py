@@ -1,4 +1,6 @@
 """Background playlist ingestion: metadata -> transcripts -> embeddings."""
+import os
+import tempfile
 import threading
 import time
 import traceback
@@ -11,6 +13,19 @@ from . import embeddings
 from . import search as search_mod
 from .config import MAX_VIDEOS_PER_PLAYLIST, REQUEST_DELAY, TRANSCRIPT_WORKERS
 from .youtube import fetch_playlist, fetch_transcript
+
+
+def _seeded_youtube_ids():
+    """YouTube IDs covered by bundled verified transcripts (SEEDS_PATH).
+    The ingest skips Whisper for these — the seeds are better quality."""
+    sp = os.environ.get("SEEDS_PATH")
+    if not sp:
+        return set()
+    try:
+        import json
+        return set(json.loads(open(sp).read()))
+    except Exception:
+        return set()
 
 
 def run_playlist_job(jid: str, pid: str, url: str):
@@ -50,6 +65,45 @@ def run_playlist_job(jid: str, pid: str, url: str):
 
         with ThreadPoolExecutor(max_workers=TRANSCRIPT_WORKERS) as ex:
             list(ex.map(one, stored))
+
+        # ---- whisper transcription for videos with no captions at all.
+        # This is what makes "100% analysis" possible for any playlist:
+        # episodes YouTube provides no captions for get transcribed from
+        # audio instead of being left invisible to search. Skips videos
+        # covered by bundled verified seeds (they're better quality).
+        missing = [v for v in db.get_videos(pid) if not v["has_transcript"]]
+        seeded_ids = _seeded_youtube_ids()
+        missing = [v for v in missing if v["youtube_id"] not in seeded_ids]
+        if missing:
+            from pathlib import Path as _P
+            from . import analyze as _analyze
+            from .youtube import download_audio as _dl_audio
+            tmpdir = _P(tempfile.mkdtemp(prefix="sf_whisper_"))
+            for i, v in enumerate(missing):
+                yid = v["youtube_id"]
+                progress(f"Transcribing audio ({i+1}/{len(missing)})",
+                         i, len(missing))
+                mp3 = tmpdir / f"{yid}.mp3"
+                try:
+                    _dl_audio(yid, mp3)
+                    segs = _analyze.transcribe_audio_file(mp3)
+                    if segs:
+                        db.add_segments(v["id"], segs)
+                        db.mark_transcript(v["id"], True)
+                        print(f"[ingest] whisper ok: {yid} ({len(segs)} segs)")
+                    else:
+                        print(f"[ingest] whisper empty: {yid}")
+                except Exception as e:
+                    print(f"[ingest] whisper failed for {yid}: {e}")
+                finally:
+                    try:
+                        mp3.unlink()
+                    except OSError:
+                        pass
+            try:
+                tmpdir.rmdir()
+            except OSError:
+                pass
 
         # ---- embeddings
         progress("Indexing for semantic search", 0, 1)
