@@ -440,3 +440,58 @@ if st.button("🔍 Analyze uploaded video", type="primary", key="analyze_up",
     st.rerun()
 
 st.caption("Note: analyzed data is kept while the app is running; very long playlists take a few minutes to analyze.")
+
+# ------------------------------------------------- find which episode a clip is from
+st.divider()
+st.header("🎯 Find which episode a clip is from")
+st.caption("Upload a short clip — it gets transcribed and matched against the "
+           "currently selected playlist to find the exact episode and timestamp.")
+up2 = st.file_uploader(
+    "Upload a clip",
+    type=["mp4", "mkv", "webm", "mov", "mp3", "wav", "m4a"],
+    key="clip_up",
+)
+if st.button("🔍 Find episode for this clip", type="primary", key="find_ep",
+             disabled=up2 is None):
+    if up2 is None:
+        st.warning("Please choose a clip first.")
+        st.stop()
+    cpath = _uploads_dir() / f"clip_{up2.name}"
+    with open(cpath, "wb") as f:
+        f.write(up2.getbuffer())
+    try:
+        with st.spinner("Transcribing clip and matching against the playlist…"):
+            from backend import analyze as _analyze
+            result = _analyze.analyze_clip(pid, cpath)
+    except Exception as e:
+        st.error(f"Could not analyze the clip: {e}")
+        st.stop()
+    finally:
+        try:
+            cpath.unlink()
+        except OSError:
+            pass
+    if not result.get("ok"):
+        st.error(result.get("error", "Could not analyze the clip."))
+        st.stop()
+    results = result.get("results", []) + result.get("alternatives", [])
+    if not results:
+        st.warning("No matching episode found. The clip's dialogue doesn't match any episode's transcript closely. "
+                   "Try describing the scene in words instead.")
+        with st.expander("Clip transcript"):
+            st.write(result.get("clip_transcript", ""))
+        st.stop()
+    st.success(f"✅ Found it!")
+    with st.expander("Clip transcript"):
+        st.write(result.get("clip_transcript", ""))
+    for r in results[:3]:
+        ep = r.get("episode", "?")
+        title = r.get("title", "")
+        ts = r.get("timestamp_hms", "")
+        url = r.get("url_at", "")
+        conf = r.get("confidence", "")
+        score = r.get("score", 0)
+        if url:
+            st.markdown(f"**Episode {ep}** @ `{ts}` — [{title}]({url}) — {conf} (match {score:.0%})")
+        else:
+            st.markdown(f"**Episode {ep}** @ `{ts}` — {title} — {conf} (match {score:.0%})")
