@@ -240,18 +240,26 @@ def search(pid, query, mode="auto", top_k=8):
         if cov < 1.0:
             m["score"] = m["score"] * cov
     ranked = sorted(merged.values(), key=lambda r: r["score"], reverse=True)
+    # Recompute distinctive-term coverage directly on each result's matched
+    # text. This is bulletproof: it uses the actual dialogue shown to the
+    # user, not a merged factor from different match signals.
+    _dist = distinctive_terms(query)
     for r in ranked:
         conf = _confidence(r["score"])
         # Hard cap: if the user named distinctive terms (names etc.) and
         # none of them appear in the scene, it can never be high confidence
         # no matter how strong the generic-word match is. Partial coverage
         # caps at medium.
-        cov = r.get("cov_factor", 1.0)
-        if cov <= 0.36:  # floor value = zero distinctive terms matched
+        _rtext = " ".join(
+            (l.get("text", "") if isinstance(l, dict) else str(l))
+            for l in r.get("matched_lines", []))
+        _cov, _ = coverage_factor(_dist, _rtext)
+        if _dist and _cov <= 0.36:  # floor value = zero terms matched
             conf = "low"
-        elif cov < 1.0 and conf == "high":
+        elif _dist and _cov < 1.0 and conf == "high":
             conf = "medium"
         r["confidence"] = conf
+        r["cov_factor"] = round(_cov, 3)
         r["score"] = round(r["score"], 3)
 
     results = ranked[:3]
