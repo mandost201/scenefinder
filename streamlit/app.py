@@ -302,32 +302,35 @@ st.caption(f"{len(vids)} episodes • {with_cap} with searchable captions • {d
 
 # ---- transcribe episodes that have no captions (runs on the server)
 _missing = [v for v in vids if not v.get("has_transcript")]
-if _missing and "tx_thread" not in st.session_state:
-    st.session_state["tx_thread"] = None
 if _missing:
-    _tx_running = st.session_state.get("tx_thread") is not None and \
-        st.session_state["tx_thread"].is_alive()
+    _tx = st.session_state.get("tx_thread")
+    _tx_running = _tx is not None and _tx.is_alive()
     if _tx_running:
         st.info("🎙️ Transcribing episodes without captions in the background… "
-                "you can keep searching; newly transcribed episodes become searchable automatically.")
-    elif st.button(f"🎙️ Transcribe {len(_missing)} episode(s) without captions",
-                   help="Uses AI transcription on the server so every episode becomes searchable. Takes a while; runs in the background."):
-        import threading
-        from backend import ingest as _ingest
+                "you can keep searching; newly transcribed episodes become searchable automatically. "
+                "This takes a while (39 episodes).")
+    else:
+        if _tx is not None:
+            # thread finished (or died); clear handle
+            st.session_state["tx_thread"] = None
+        if st.button(f"🎙️ Transcribe {len(_missing)} episode(s) without captions",
+                     key="tx_btn",
+                     help="Uses AI transcription on the server so every episode becomes searchable. Takes a while; runs in the background."):
+            import threading
+            from backend import ingest as _ingest
 
-        def _run():
-            try:
-                _ingest.transcribe_missing_episodes(pid)
-            except Exception as e:
-                print(f"[app] background transcription failed: {e}")
+            def _run():
+                try:
+                    n = _ingest.transcribe_missing_episodes(pid)
+                    print(f"[app] background transcription done: {n} episodes")
+                except Exception as e:
+                    print(f"[app] background transcription failed: {e}")
 
-        st.session_state["tx_thread"] = threading.Thread(target=_run, daemon=True)
-        st.session_state["tx_thread"].start()
-        st.rerun()
-elif st.session_state.get("tx_thread") is not None:
-    # finished at some point; clear the handle so the button can reappear if needed
-    if not st.session_state["tx_thread"].is_alive():
-        st.session_state["tx_thread"] = None
+            th = threading.Thread(target=_run, daemon=True)
+            st.session_state["tx_thread"] = th
+            th.start()
+            st.success("✅ Transcription started in the background! You can keep using the site.")
+            st.info("🎙️ Transcribing episodes without captions… newly transcribed episodes become searchable automatically.")
 
 # ---------------------------------------------------------------- search
 query = st.text_input(
