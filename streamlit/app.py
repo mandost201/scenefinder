@@ -15,6 +15,70 @@ import streamlit as st
 
 from backend import db, ingest
 from backend import search as search_mod
+from backend import embeddings as emb_mod
+
+# ---------------------------------------------------------------- seed transcripts
+# Episodes whose YouTube captions are missing/broken get a human-verified
+# transcript bundled with the app, so they stay searchable forever.
+SEEDS_PATH = Path(__file__).resolve().parent / "seeds.json"
+
+def _load_seeds():
+    try:
+        import json
+        if SEEDS_PATH.exists():
+            return json.loads(SEEDS_PATH.read_text())
+    except Exception as e:
+        print(f"[seeds] load failed: {e}")
+    return {}
+
+def _embed_segments_for_videos(pid, video_ids):
+    """Embed only the segments of the given videos (used after seeding)."""
+    if not emb_mod.available():
+        return
+    batch, seg_ids = [], []
+    for v in db.get_videos(pid):
+        if v["id"] not in video_ids:
+            continue
+        for s in db.get_segments(v["id"]):
+            if len(s["text"]) < 3:
+                continue
+            seg_ids.append(s["id"])
+            batch.append(s["text"][:500])
+    import numpy as np
+    B = 64
+    for i in range(0, len(batch), B):
+        try:
+            vecs = emb_mod.embed(batch[i:i + B])
+        except Exception as e:
+            print(f"[seeds] embedding batch failed: {e}")
+            break
+        pairs = [(seg_ids[i + j], int(vecs.shape[1]),
+                  vecs[j].astype(np.float32).tobytes())
+                 for j in range(vecs.shape[0])]
+        db.save_embeddings(pairs)
+
+def apply_seed_transcripts(pid):
+    """Fill in transcripts for videos that have none, from bundled seeds.
+    Returns number of videos seeded."""
+    seeds = _load_seeds()
+    if not seeds:
+        return 0
+    seeded = []
+    for v in db.get_videos(pid):
+        if v.get("has_transcript"):
+            continue
+        yid = v.get("youtube_id")
+        if yid in seeds:
+            segs = [(float(s[0]), float(s[1]), str(s[2])) for s in seeds[yid]]
+            db.add_segments(v["id"], segs)
+            db.mark_transcript(v["id"], True)
+            seeded.append(v["id"])
+            print(f"[seeds] seeded transcript for {yid} ({len(segs)} segments)")
+    if seeded:
+        _embed_segments_for_videos(pid, set(seeded))
+        search_mod.invalidate_cache(pid)
+        db.update_playlist(pid, status="ready")
+    return len(seeded)
 
 st.set_page_config(
     page_title="SceneFinder — AI YouTube Scene Finder",
@@ -78,6 +142,11 @@ if jid:
     if job and job.get("status") not in ("done", "error"):
         st.info("Analyzing playlist — this takes a few minutes for long playlists. You can leave and come back.")
         job = poll_job(jid)
+        if job and job.get("status") == "done":
+            with st.spinner("Filling in verified transcripts for episodes missing captions…"):
+                n = apply_seed_transcripts(pid)
+                if n:
+                    st.success(f"Added verified transcripts for {n} episode(s) missing captions.")
         st.rerun()
     elif job and job.get("status") == "error":
         st.error(f"Analysis failed: {job.get('error')}")
@@ -100,6 +169,11 @@ pid = options[choice]
 st.session_state.active_pid = pid
 
 pl = db.get_playlist(pid)
+# Backfill verified transcripts for episodes missing captions (cheap no-op
+# when everything already has transcripts).
+_n_seeded = apply_seed_transcripts(pid)
+if _n_seeded:
+    st.success(f"✅ Added verified transcripts for {_n_seeded} episode(s) missing captions.")
 vids = db.get_videos(pid)
 with_cap = sum(1 for v in vids if v.get("has_transcript"))
 st.caption(f"{len(vids)} episodes • {with_cap} with searchable captions • {db.segment_count(pid):,} transcript segments")
