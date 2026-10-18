@@ -177,6 +177,28 @@ def _whisper_model():
     # "base" fits the free 1GB container; "small" is better if RAM allows.
     return WhisperModel("base", device="cpu", compute_type="int8")
 
+
+def _transcribe_upload(vpath):
+    """Transcribe an uploaded file, working around the faster-whisper/PyAV
+    metadata_errors incompatibility (old faster-whisper + new PyAV)."""
+    model = _whisper_model()
+    try:
+        segments, _info = model.transcribe(str(vpath), beam_size=5)
+    except TypeError:
+        import av
+        _orig = av.open
+
+        def _patched(*a, **k):
+            k.pop("metadata_errors", None)
+            return _orig(*a, **k)
+        av.open = _patched
+        try:
+            segments, _info = model.transcribe(str(vpath), beam_size=5)
+        finally:
+            av.open = _orig
+    return [(round(s.start, 1), round(s.end, 1), s.text.strip())
+            for s in segments if s.text.strip()]
+
 def _is_upload_video(r):
     return str(r.get("youtube_id") or "").startswith("upload-")
 
@@ -365,10 +387,7 @@ if st.button("🔍 Analyze uploaded video", type="primary", key="analyze_up",
     _register_upload(yid, vpath)
     try:
         with st.spinner("Transcribing video… long videos can take a while, please keep this page open."):
-            model = _whisper_model()
-            segments, _info = model.transcribe(str(vpath), beam_size=5)
-            segs = [(round(s.start, 1), round(s.end, 1), s.text.strip())
-                    for s in segments if s.text.strip()]
+            segs = _transcribe_upload(vpath)
     except Exception as e:
         st.error(f"Transcription failed: {e}")
         st.stop()
