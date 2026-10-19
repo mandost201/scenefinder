@@ -178,12 +178,13 @@ def _whisper_model():
     return WhisperModel("base", device="cpu", compute_type="int8")
 
 
-def _transcribe_upload(vpath):
+def _transcribe_upload(vpath, task="transcribe"):
     """Transcribe an uploaded file, working around the faster-whisper/PyAV
-    metadata_errors incompatibility (old faster-whisper + new PyAV)."""
+    metadata_errors incompatibility (old faster-whisper + new PyAV).
+    task='transcribe' (default) or 'translate' (translate to English)."""
     model = _whisper_model()
     try:
-        segments, _info = model.transcribe(str(vpath), beam_size=5)
+        segments, _info = model.transcribe(str(vpath), beam_size=5, task=task)
     except TypeError:
         import av
         _orig = av.open
@@ -193,7 +194,7 @@ def _transcribe_upload(vpath):
             return _orig(*a, **k)
         av.open = _patched
         try:
-            segments, _info = model.transcribe(str(vpath), beam_size=5)
+            segments, _info = model.transcribe(str(vpath), beam_size=5, task=task)
         finally:
             av.open = _orig
     return [(round(s.start, 1), round(s.end, 1), s.text.strip())
@@ -461,13 +462,16 @@ if st.button("🔍 Find episode for this clip", type="primary", key="find_ep",
         f.write(up2.getbuffer())
     try:
         with st.spinner("Transcribing clip and matching against the playlist…"):
-            # transcribe without ffmpeg (not available on Streamlit Cloud)
-            segs = _transcribe_upload(cpath)
+            # transcribe + translate to English (episodes have English captions)
+            # without ffmpeg (not available on Streamlit Cloud)
+            segs = _transcribe_upload(cpath, task="translate")
             clip_text = " ".join(t for _, _, t in segs)
             if not clip_text.strip():
                 st.warning("No speech detected in the clip. Clips are matched by spoken dialogue.")
                 st.stop()
             # align against the selected playlist (no ffmpeg needed)
+            # Strategy: (1) precise word alignment, (2) fallback to semantic
+            # search using the translated clip text as the query.
             from backend.align import align_against_playlist
             from backend import search as _search
             from backend.vtt import format_hms
@@ -479,6 +483,20 @@ if st.button("🔍 Find episode for this clip", type="primary", key="find_ep",
                 if s:
                     pairs.append((v, s))
             ranked = align_against_playlist(clip_text, pairs)
+            # Fallback: if word alignment finds nothing, use semantic search
+            # with the clip transcript as the query.
+            _fallback_results = []
+            if not ranked:
+                _sr = _search.search(pid, clip_text, top_k=3)
+                for r in _sr.get("results", []):
+                    _fallback_results.append({
+                        "episode": r.get("episode", "?"),
+                        "title": r.get("title", ""),
+                        "timestamp_hms": r.get("timestamp_hms", ""),
+                        "url_at": r.get("url_at", ""),
+                        "confidence": r.get("confidence", ""),
+                        "score": r.get("score", 0),
+                    })
     except Exception as e:
         st.error(f"Could not analyze the clip: {e}")
         st.stop()
@@ -487,10 +505,10 @@ if st.button("🔍 Find episode for this clip", type="primary", key="find_ep",
             cpath.unlink()
         except OSError:
             pass
-    if not ranked:
+    if not ranked and not _fallback_results:
         st.warning("No matching episode found. The clip's dialogue doesn't match any episode's transcript closely. "
                    "Try describing the scene in words instead.")
-        with st.expander("Clip transcript"):
+        with st.expander("Clip transcript (translated to English)"):
             st.write(clip_text)
         st.stop()
 
@@ -503,9 +521,13 @@ if st.button("🔍 Find episode for this clip", type="primary", key="find_ep",
             "confidence": conf, "score": round(score, 3),
         }
 
-    results = [_to_result(s, v, a) for s, v, a in ranked[:3]]
-    st.success(f"✅ Found it!")
-    with st.expander("Clip transcript"):
+    if ranked:
+        results = [_to_result(s, v, a) for s, v, a in ranked[:3]]
+        st.success(f"✅ Found it! (precise dialogue match)")
+    else:
+        results = _fallback_results
+        st.success(f"✅ Found it! (semantic match)")
+    with st.expander("Clip transcript (translated to English)"):
         st.write(clip_text)
     for r in results:
         ep = r.get("episode", "?")
